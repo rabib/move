@@ -4,6 +4,7 @@
 
 use crate::{
     logging::expect_no_verification_errors,
+    move_vm::RuntimeConfig,
     native_functions::{NativeFunction, NativeFunctions, UnboxedNativeFunction},
     session::LoadedFunctionInstantiation,
 };
@@ -16,7 +17,7 @@ use move_binary_format::{
         FieldHandleIndex, FieldInstantiationIndex, FunctionDefinition, FunctionDefinitionIndex,
         FunctionHandleIndex, FunctionInstantiationIndex, Signature, SignatureIndex, SignatureToken,
         StructDefInstantiationIndex, StructDefinition, StructDefinitionIndex,
-        StructFieldInformation, TableIndex,
+        StructFieldInformation, StructHandleIndex, TableIndex, Visibility,
     },
     IndexKind,
 };
@@ -484,10 +485,16 @@ pub(crate) struct Loader {
     module_cache_hits: RwLock<BTreeSet<ModuleId>>,
 
     verifier_config: VerifierConfig,
+
+    runtime_config: RuntimeConfig,
 }
 
 impl Loader {
-    pub(crate) fn new(natives: NativeFunctions, verifier_config: VerifierConfig) -> Self {
+    pub(crate) fn new(
+        natives: NativeFunctions,
+        verifier_config: VerifierConfig,
+        runtime_config: RuntimeConfig,
+    ) -> Self {
         Self {
             scripts: RwLock::new(ScriptCache::new()),
             module_cache: RwLock::new(ModuleCache::new()),
@@ -496,6 +503,7 @@ impl Loader {
             invalidated: RwLock::new(false),
             module_cache_hits: RwLock::new(BTreeSet::new()),
             verifier_config,
+            runtime_config,
         }
     }
 
@@ -646,6 +654,8 @@ impl Loader {
     // Script verification steps.
     // See `verify_module()` for module verification steps.
     fn verify_script(&self, script: &CompiledScript) -> VMResult<()> {
+        fail::fail_point!("verifier-failpoint-3", |_| { Ok(()) });
+
         move_bytecode_verifier::verify_script_with_config(&self.verifier_config, script)
     }
 
@@ -767,6 +777,8 @@ impl Loader {
         bundle_unverified: &BTreeSet<ModuleId>,
         data_store: &impl DataStore,
     ) -> VMResult<()> {
+        fail::fail_point!("verifier-failpoint-1", |_| { Ok(()) });
+
         // Performs all verification steps to load the module without loading it, i.e., the new
         // module will NOT show up in `module_cache`. In the module republishing case, it means
         // that the old module is still in the `module_cache`, unless a new Loader is created,
@@ -998,6 +1010,18 @@ impl Loader {
                     .finish(Location::Module(id.clone()))
             })
             .map_err(expect_no_verification_errors)?;
+
+        fail::fail_point!("verifier-failpoint-2", |_| { Ok(module.clone()) });
+
+        if self.runtime_config.paranoid_type_checks {
+            if &module.self_id() != id {
+                return Err(
+                    PartialVMError::new(StatusCode::UNKNOWN_INVARIANT_VIOLATION_ERROR)
+                        .with_message(format!("Module self id mismatch with storage"))
+                        .finish(Location::Module(id.clone())),
+                );
+            }
+        }
 
         // bytecode verifier checks that can be performed with the module itself
         move_bytecode_verifier::verify_module_with_config(&self.verifier_config, &module)
@@ -1377,6 +1401,49 @@ impl<'a> Resolver<'a> {
         Type::Struct(struct_def)
     }
 
+    pub(crate) fn get_struct_fields(
+        &self,
+        idx: StructDefinitionIndex,
+    ) -> PartialVMResult<Arc<StructType>> {
+        let idx = match &self.binary {
+            BinaryType::Module(module) => module.struct_at(idx),
+            BinaryType::Script(_) => unreachable!("Scripts cannot have type instructions"),
+        };
+        self.loader.get_struct_type(idx).ok_or_else(|| {
+            PartialVMError::new(StatusCode::UNKNOWN_INVARIANT_VIOLATION_ERROR)
+                .with_message("Struct Definition not resolved".to_string())
+        })
+    }
+
+    pub(crate) fn instantiate_generic_fields(
+        &self,
+        idx: StructDefInstantiationIndex,
+        ty_args: &[Type],
+    ) -> PartialVMResult<Vec<Type>> {
+        let struct_inst = match &self.binary {
+            BinaryType::Module(module) => module.struct_instantiation_at(idx.0),
+            BinaryType::Script(_) => unreachable!("Scripts cannot have type instructions"),
+        };
+        let struct_type = self
+            .loader
+            .get_struct_type(struct_inst.def)
+            .ok_or_else(|| {
+                PartialVMError::new(StatusCode::UNKNOWN_INVARIANT_VIOLATION_ERROR)
+                    .with_message("Struct Definition not resolved".to_string())
+            })?;
+
+        let instantiation_types = struct_inst
+            .instantiation
+            .iter()
+            .map(|inst_ty| inst_ty.subst(ty_args))
+            .collect::<PartialVMResult<Vec<_>>>()?;
+        struct_type
+            .fields
+            .iter()
+            .map(|ty| ty.subst(&instantiation_types))
+            .collect::<PartialVMResult<Vec<_>>>()
+    }
+
     pub(crate) fn instantiate_generic_type(
         &self,
         idx: StructDefInstantiationIndex,
@@ -1396,6 +1463,39 @@ impl<'a> Resolver<'a> {
         ))
     }
 
+    pub(crate) fn resolve_signature_token(&self, tok: &SignatureToken) -> PartialVMResult<Type> {
+        Ok(match tok {
+            SignatureToken::Address => Type::Address,
+            SignatureToken::Bool => Type::Bool,
+            SignatureToken::Signer => Type::Signer,
+            SignatureToken::U8 => Type::U8,
+            SignatureToken::U64 => Type::U64,
+            SignatureToken::U128 => Type::U128,
+            SignatureToken::Reference(r) => {
+                Type::Reference(Box::new(self.resolve_signature_token(r)?))
+            }
+            SignatureToken::MutableReference(r) => {
+                Type::MutableReference(Box::new(self.resolve_signature_token(r)?))
+            }
+            SignatureToken::Struct(idx) => Type::Struct(self.get_struct_handle_idx(*idx)),
+            SignatureToken::Vector(ty) => Type::Vector(Box::new(self.resolve_signature_token(ty)?)),
+            SignatureToken::StructInstantiation(idx, tys) => Type::StructInstantiation(
+                self.get_struct_handle_idx(*idx),
+                tys.iter()
+                    .map(|tok| self.resolve_signature_token(tok))
+                    .collect::<PartialVMResult<Vec<_>>>()?,
+            ),
+            SignatureToken::TypeParameter(idx) => Type::TyParam(*idx as usize),
+        })
+    }
+
+    fn get_struct_handle_idx(&self, idx: StructHandleIndex) -> CachedStructIndex {
+        match &self.binary {
+            BinaryType::Module(module) => module.struct_handle_at(idx),
+            BinaryType::Script(script) => script.struct_handle_at(idx),
+        }
+    }
+
     fn single_type_at(&self, idx: SignatureIndex) -> &Type {
         match &self.binary {
             BinaryType::Module(module) => module.single_type_at(idx),
@@ -1410,6 +1510,10 @@ impl<'a> Resolver<'a> {
     ) -> PartialVMResult<Type> {
         let ty = self.single_type_at(idx);
         ty.subst(ty_args)
+    }
+
+    pub(crate) fn abilities(&self, ty: &Type) -> PartialVMResult<AbilitySet> {
+        self.loader.abilities(ty)
     }
 
     //
@@ -1441,6 +1545,31 @@ impl<'a> Resolver<'a> {
         match &self.binary {
             BinaryType::Module(module) => module.field_instantiation_count(idx.0),
             BinaryType::Script(_) => unreachable!("Scripts cannot have type instructions"),
+        }
+    }
+
+    pub(crate) fn field_handle_to_struct(&self, idx: FieldHandleIndex) -> Type {
+        match &self.binary {
+            BinaryType::Module(module) => Type::Struct(module.field_handles[idx.0 as usize].owner),
+            BinaryType::Script(_) => unreachable!("Scripts cannot have field instructions"),
+        }
+    }
+
+    pub(crate) fn field_instantiation_to_struct(
+        &self,
+        idx: FieldInstantiationIndex,
+        args: &[Type],
+    ) -> PartialVMResult<Type> {
+        match &self.binary {
+            BinaryType::Module(module) => Ok(Type::StructInstantiation(
+                module.field_instantiations[idx.0 as usize].owner,
+                module.field_instantiations[idx.0 as usize]
+                    .instantiation
+                    .iter()
+                    .map(|ty| ty.subst(args))
+                    .collect::<PartialVMResult<Vec<_>>>()?,
+            )),
+            BinaryType::Script(_) => unreachable!("Scripts cannot have field instructions"),
         }
     }
 
@@ -1674,7 +1803,15 @@ impl Module {
                 let fh_idx = f_inst.handle;
                 let owner = field_handles[fh_idx.0 as usize].owner;
                 let offset = field_handles[fh_idx.0 as usize].offset;
-                field_instantiations.push(FieldInstantiation { offset, owner });
+                let mut instantiation = vec![];
+                for ty in &module.signature_at(f_inst.type_parameters).0 {
+                    instantiation.push(cache.make_type_while_loading(&module, ty)?);
+                }
+                field_instantiations.push(FieldInstantiation {
+                    offset,
+                    owner,
+                    instantiation,
+                });
             }
 
             Ok(())
@@ -1701,6 +1838,10 @@ impl Module {
 
     fn struct_at(&self, idx: StructDefinitionIndex) -> CachedStructIndex {
         self.structs[idx.0 as usize].idx
+    }
+
+    fn struct_handle_at(&self, idx: StructHandleIndex) -> CachedStructIndex {
+        self.struct_refs[idx.0 as usize]
     }
 
     fn struct_instantiation_at(&self, idx: u16) -> &StructInstantiation {
@@ -1869,6 +2010,7 @@ impl Script {
             type_parameters,
             native,
             def_is_native,
+            def_is_friend_or_private: false,
             scope,
             name,
         });
@@ -1931,6 +2073,10 @@ impl Script {
         self.function_refs[idx as usize]
     }
 
+    fn struct_handle_at(&self, idx: StructHandleIndex) -> CachedStructIndex {
+        self.struct_refs[idx.0 as usize]
+    }
+
     fn function_instantiation_at(&self, idx: u16) -> &FunctionInstantiation {
         &self.function_instantiations[idx as usize]
     }
@@ -1961,6 +2107,7 @@ pub(crate) struct Function {
     type_parameters: Vec<AbilitySet>,
     native: Option<NativeFunction>,
     def_is_native: bool,
+    def_is_friend_or_private: bool,
     scope: Scope,
     name: Identifier,
 }
@@ -1975,6 +2122,12 @@ impl Function {
         let handle = module.function_handle_at(def.function);
         let name = module.identifier_at(handle.name).to_owned();
         let module_id = module.self_id();
+
+        let def_is_friend_or_private = match def.visibility {
+            Visibility::Friend | Visibility::Private => true,
+            Visibility::Public => false,
+        };
+
         let (native, def_is_native) = if def.is_native() {
             (
                 natives.resolve(
@@ -2016,6 +2169,7 @@ impl Function {
             type_parameters,
             native,
             def_is_native,
+            def_is_friend_or_private,
             scope,
             name,
         }
@@ -2052,6 +2206,14 @@ impl Function {
 
     pub(crate) fn local_count(&self) -> usize {
         self.locals.len()
+    }
+
+    pub(crate) fn local_types(&self) -> &[SignatureToken] {
+        &self.locals.0
+    }
+
+    pub(crate) fn return_types(&self) -> &[SignatureToken] {
+        &self.return_.0
     }
 
     pub(crate) fn arg_count(&self) -> usize {
@@ -2093,6 +2255,10 @@ impl Function {
 
     pub(crate) fn is_native(&self) -> bool {
         self.def_is_native
+    }
+
+    pub(crate) fn is_friend_or_private(&self) -> bool {
+        self.def_is_friend_or_private
     }
 
     pub(crate) fn get_native(&self) -> PartialVMResult<&UnboxedNativeFunction> {
@@ -2161,6 +2327,7 @@ struct FieldInstantiation {
     // `ModuelCache::structs` global table index. It is the generic type.
     #[allow(unused)]
     owner: CachedStructIndex,
+    instantiation: Vec<Type>,
 }
 
 //
@@ -2281,7 +2448,21 @@ impl Loader {
             .iter()
             .map(|ty| self.type_to_type_layout_impl(ty, depth + 1))
             .collect::<PartialVMResult<Vec<_>>>()?;
-        let struct_layout = MoveStructLayout::new(field_layouts);
+
+        let struct_layout = if self.runtime_config.paranoid_type_checks {
+            MoveStructLayout::CheckedRuntime {
+                fields: field_layouts,
+                tag: if ty_args.is_empty() {
+                    Type::Struct(gidx)
+                } else {
+                    Type::StructInstantiation(gidx, ty_args.to_vec())
+                }
+                .get_hash(),
+                ability: struct_type.abilities.into_u8(),
+            }
+        } else {
+            MoveStructLayout::Runtime(field_layouts)
+        };
 
         self.type_cache
             .write()
@@ -2418,6 +2599,10 @@ impl Loader {
         ty: &Type,
     ) -> PartialVMResult<MoveTypeLayout> {
         self.type_to_fully_annotated_layout_impl(ty, 1)
+    }
+
+    pub(crate) fn runtime_config(&self) -> RuntimeConfig {
+        self.runtime_config
     }
 }
 

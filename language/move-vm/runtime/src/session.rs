@@ -240,7 +240,12 @@ impl<'r, 'l, S: MoveResolver> Session<'r, 'l, S> {
     /// This MUST NOT be called if there is a previous invocation that failed with an invariant violation.
     pub fn finish(self) -> VMResult<(ChangeSet, Vec<Event>)> {
         self.data_cache
-            .into_effects()
+            .into_effects(
+                self.runtime
+                    .loader()
+                    .runtime_config()
+                    .paranoid_hot_potato_checks,
+            )
             .map_err(|e| e.finish(Location::Undefined))
     }
 
@@ -254,7 +259,12 @@ impl<'r, 'l, S: MoveResolver> Session<'r, 'l, S> {
             ..
         } = self;
         let (change_set, events) = data_cache
-            .into_effects()
+            .into_effects(
+                self.runtime
+                    .loader()
+                    .runtime_config()
+                    .paranoid_hot_potato_checks,
+            )
             .map_err(|e| e.finish(Location::Undefined))?;
         Ok((change_set, events, native_extensions))
     }
